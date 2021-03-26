@@ -1,0 +1,735 @@
+---
+title: "MS&E 226: PR1"
+author: "Ramesh Manian (rmanian@stanford.edu) & uzair Mansuri (umansuri@stanford.edu)"
+date: "10/19/2020"
+output: 
+  pdf_document: 
+    keep_tex: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy.opts=list(width.cutoff=60), 
+                      message = FALSE, fig.width=8, fig.height=7)
+library(tidyverse)
+library(Metrics)
+library(cvTools)
+library(GGally)
+library(corrplot)
+library(kableExtra)
+library(ggthemes)
+library(knitr)
+library(kableExtra)
+library(tokenizers)
+library("tm")
+library(glmnet)
+library(randomForest)
+library(boot)
+```
+**Project group members**: *Ramesh Manian, Uzair Mansuri*.
+
+Set seed for repeatability
+```{r}
+set.seed(3945827)
+```
+
+## Load the dataset and explore
+```{r}
+#Extracting Data & creating Dataframe
+
+df_movies<-load("C:/Users/uzair/OneDrive/MS&E 226 - Project 1/netflix/movies_merged")
+df = movies_merged
+
+#Gathering information on explanatory variables for 40,789 observations
+cat("Column names:", end="\n", file="")
+colnames(df)
+```
+
+## Cleaning up data
+
+### Remove non-movie rows
+```{r}
+# Remove all rows from df that do not correspond to movies
+df2 <- df[df$Type == "movie",]
+dim(df2)
+
+# save df2 as df
+df <- df2
+
+#rem_cols <- c(tomatoConsensus, Plot, Poster, Website, imdbID, tomoatoImage, tomatoConsensus, BoxOffice, tomatoURL, DVD, Response, Language, Country)
+```
+### Drop rows with missing `Gross` value
+
+our goal is to model `Gross` revenue against other variables, therefore, rows that have missing `Gross` values are not useful to us.
+
+```{r}
+# Remove rows with missing Gross value
+# subset rows with valid gross values
+df_gross_val = subset(df, !is.na(df$Gross))
+df = df_gross_val
+cat("Movies only dataset with valid Gross value has", dim(df)[1], "samples and", dim(df)[2], "features", "\n")
+```
+
+### Process `Runtime` column
+
+The variable `Runtime` represents the length of the title as a string. Let us convert it to a numeric value (in minutes) and replace `Runtime` with the new numeric column.
+```{r}
+# Replace df$Runtime with a numeric column containing the runtime in minutes
+# look for three time patterns in run_time "xx h yy min" or "xx h" or "xx min" 
+runtime_pattern = c("(\\d+)\\sh\\s(\\d+)\\smin", "(\\d+)\\sh", "(\\d+)\\smin")
+normalize_NA_convert_to_min <- function(s) {
+    # convert N/A to NA
+    if (s == "N/A"|| s == "n/a" || s == "N/a" || s == "n/A") return(NA)
+    # go through the possible ways time can be shown
+    for (i in 1:length(runtime_pattern)) {
+        val = str_match(s, runtime_pattern[i])
+        if (!is.na(val[1])) {
+            if (i == 1) return(as.numeric(val[2])*60 + as.numeric(val[3]))
+            else if (i == 2) return(as.numeric(val[2])*60)
+            else if (i == 3) return(as.numeric(val[2]))
+        }
+    }
+}
+df$Runtime = sapply(df$Runtime, normalize_NA_convert_to_min)
+```
+Let us extract valid observations; ones with budget information in our case
+```{r}
+# Remove rows that have NA values in runtime and budget columns
+df_rt_budget <- subset(df, !is.na(df$Runtime) & 
+                      !is.na(df$Budget))
+# 4520 observations are there with just Runtime and Budget being non-NA
+cat("Number of rows to be removed with non NA values in Runtime and budget :", 
+    nrow(df_rt_budget))
+```
+### Eliminate mismatched rows
+
+Compare the `Released` column (string representation of release date) with either `Year` or `Date` (numeric representation of the year) to find mismatches.
+
+```{r}
+# Remove mismatched rows
+# Remove all rows with Year/Date/release mismatch 
+correct_year_mismatch = function(dft){
+    dft["YearRel"] = as.numeric(format(as.Date(dft$Released, 
+                                      format = "%Y-%m-%d"), "%Y"))
+    c1 = (is.na(dft$Date) | (dft$Year == dft$Date) | 
+              (!is.na(dft$YearRel) && dft$YearRel == dft$Date))
+    dft = dft[c1,]
+    # delete temporary column or numeric representation of Released
+    dft = subset(dft, select=-YearRel)
+    return(dft)
+}
+
+df_non_mismatched_year = correct_year_mismatch(df)
+new_cnt = nrow(df_non_mismatched_year)
+# compute percentage of mis-matched rows removed
+df = df_non_mismatched_year
+cat("Non-mismatched dataset has", dim(df)[1], "samples and", dim(df)[2], "features", "\n")
+```
+### Drop `Domestic_Gross` column
+
+`Domestic_Gross` is basically the amount of revenue a movie earned within the US. Quite likely, it is very highly correlated with `Gross` and is in fact equal to it for movies that were not released globally. Hence, we will remove it for modeling purposes.
+
+```{r}
+# Exclude the `Domestic_Gross` column
+df_gross_removed = subset(df, select=-Domestic_Gross)
+df = df_gross_removed
+cat("Domestic_Gross removed dataset has", dim(df)[1], "samples and", dim(df)[2], "features", "\n")
+```
+
+### Final preprocessed dataset
+
+Let us look at the dimensions of the preprocessed dataset that we will be using for modeling and evaluation. Let us also print all the final covariates list. 
+
+```{r}
+# Print the dimensions of the final pre-processed dataset and column names
+cat("Pre-processed dataset has", dim(df)[1], "samples and", dim(df)[2], "features. Features are printed below.", "\n")
+pre_processed_df = df
+print(sort(colnames(df)))
+```
+
+## Model Evaluation
+
+### Numeric variables
+
+We will be using Linear Regression to predict `Gross` based on available _numeric_ variables.
+
+```{r}
+# Numeric 
+# =======================
+# Build & evaluate model 1 (numeric variables only)
+# This function randomizes data and splits into train and test datasets
+pre_process_data = function(df, test_frac=0.20){
+    # shuffle data - sample(nrow(df)) gives randomized indices for selection
+    df = df[sample(nrow(df)), ]
+    num_samples = nrow(df)
+    num_test_samples = as.integer(num_samples * test_frac)
+    num_train_samples = num_samples - num_test_samples
+    train_data = df[1:num_train_samples, ]
+    test_data = df[(num_train_samples+1):num_samples, ]
+    return(list(train_data=train_data, test_data=test_data))
+}
+
+# get data processed and ready. 
+rslt = pre_process_data(df)
+train_data = rslt$train_data
+test_data = rslt$test_data
+```
+
+For our prediction, we will focus on numeric variables. Use the filter function which gets all types of numeric variabels including floats and ints.
+
+```{r}
+train_data_numeric = Filter(is.numeric, train_data)
+test_data_numeric = Filter(is.numeric, test_data)
+
+# replace some of the numeric variables that have NA in their observations with the column mean
+train_data_numeric$imdbRating[is.na(train_data_numeric$imdbRating)] <- mean(train_data_numeric$imdbRating, na.rm = TRUE)
+train_data_numeric$Runtime[is.na(train_data_numeric$Runtime)] <- mean(train_data_numeric$Runtime, na.rm = TRUE)
+train_data_numeric$tomatoMeter[is.na(train_data_numeric$tomatoMeter)] <- mean(train_data_numeric$tomatoMeter, na.rm = TRUE)
+train_data_numeric$tomatoRating[is.na(train_data_numeric$tomatoRating)] <- mean(train_data_numeric$tomatoRating, na.rm = TRUE)
+train_data_numeric$tomatoReviews[is.na(train_data_numeric$tomatoReviews)] <- mean(train_data_numeric$tomatoReviews, na.rm = TRUE)
+train_data_numeric$tomatoFresh[is.na(train_data_numeric$tomatoFresh)] <- mean(train_data_numeric$tomatoFresh, na.rm = TRUE)
+train_data_numeric$tomatoUserMeter[is.na(train_data_numeric$tomatoUserMeter)] <- mean(train_data_numeric$tomatoUserMeter, na.rm = TRUE)
+train_data_numeric$tomatoUserRating[is.na(train_data_numeric$tomatoUserRating)] <- mean(train_data_numeric$tomatoUserRating, na.rm = TRUE)
+
+# Let us also ensure that the dataset is free from NA values
+train_data_numeric_nonNA <- na.omit(train_data_numeric)
+test_data_numeric_nonNA <- na.omit(test_data_numeric)
+```
+
+We might also want to see if we should use only a subset of numeric variables to better understand the relationship between features. To do this, we could do a correlation plot. This plot will show correlation between -1 and +1. Very strongly positively correlated ones will be shown as very dark blue circle and the intensity of blue will smaller as the +ve correlation decreases. -ve correlation is shown in orange similarly.
+
+```{r}
+tr_cor_df = cor(train_data_numeric_nonNA)
+corrplot(tr_cor_df, method="circle")
+```
+
+Based on the above, I chose only Runtime, imdbRating, imdbVotes, tomatoReviews, tomatoFresh, and Budget. I will drop the rest of the columns.
+
+```{r}
+train_data_numeric_nonNA_subset = subset(train_data_numeric_nonNA, 
+                             select=-c(tomatoRotten,Year,Date,tomatoMeter,tomatoUserMeter,tomatoUserReviews,tomatoRating))
+test_data_numeric_nonNA_subset = subset(train_data_numeric_nonNA, 
+                             select=-c(tomatoRotten,Year,Date,tomatoMeter,tomatoUserMeter,tomatoUserReviews,tomatoRating))
+```
+
+Function for performing linear regression using linear model(lm) command and gathering model stats
+
+Let us create a model and evaluate it
+```{r}
+numericModel<-lm(Gross~., data = train_data_numeric_nonNA_subset)
+print(summary(numericModel))
+numericModel.rmse <- sqrt(mean(numericModel$residuals^2))
+cat("Train RMSE is:", numericModel.rmse, "\n")
+
+#Cross validation
+numericModel_cv <- cvFit(numericModel, data = train_data_numeric_nonNA_subset, 
+                         y = train_data_numeric_nonNA_subset$Gross, 
+                         K=10)
+print(numericModel_cv)
+```
+### Transformations
+
+Let us see if we can improve the prediction quality from basic Numerical variables as much as possible by adding feature transformations of the numeric variables. We will explore both numeric transformations such as power transforms and non-numeric transformations of the numeric variables like binning (e.g. `is_budget_greater_than_3M`).
+
+Let us plot the residuals to see if there is non-linearity in features at a gross level. We can do this by plotting residuals for Gross
+
+```{r}
+
+mdl = lm(Gross~., data=train_data_numeric_nonNA_subset)
+m.res = resid(mdl)
+plot(mdl$fitted.values, m.res, 
+     ylab="Residuals", xlab="Fitted Values of Gross", 
+     main="Movies - Fitted Gross Vs Residuals")
+abline(0, 0)
+```
+There definitely exists a correlation as is evident in the residual plot above. It does not look randmly scattered as we would expect in a fully linearly fit model. It appears **biased** and **heteroscedastic**. To examine where the relations might be, let us do pairwise plot
+
+```{r}
+df_temp = subset(train_data_numeric_nonNA_subset, train_data_numeric_nonNA_subset$Gross != 0)
+suppressWarnings(ggpairs(df_temp)) + 
+  ggtitle("GGPairs plot for feature examination")
+```
+
+```{r}
+# Model 2. Transformed Numeric Variables
+# ======================================
+# Build & evaluate model 2 (transformed numeric variables only)
+
+# feature transformation functions
+# split a feature at mean value to bin into high or low (1 or 0)
+feature_xform_to_binary = function(df, feature){
+    feature_mean_val = mean(df[, feature])
+    new_label = paste0(feature, '_bin')
+    # assign all to 0
+    df[new_label] = 0
+    df[df[, feature]>feature_mean_val, new_label] = 1
+    return(df)
+}
+```
+
+Based on examining the pairwise plots we choose the variables to transform. 
+
+```{r}
+feature_transform = function(df){
+  df = na.omit(df)
+  df = feature_xform_to_binary(df, 'imdbVotes') #imdbVotes_bin - binary xform
+  df = feature_xform_to_binary(df, 'Budget') #Budget_bin - binary xform
+
+  df['Runtime_log'] = log(df$Runtime) # log xform
+  
+  df['imdbRating_P2'] = (df$imdbRating)^2 # power transform
+  df['imdbVotes_P2'] = (df$imdbVotes)^2 # power transform
+  df['tomatoUserRating_P2'] = (df$tomatoUserRating)^2 # power transform
+  return(df)
+}
+
+train_data_xform = feature_transform(train_data_numeric_nonNA_subset)
+test_data_xform = feature_transform(test_data_numeric_nonNA_subset)
+
+# call function to compute average training and test rsmes for range of sizes
+resp_var = 'Gross'
+fx = paste(resp_var, ' ~ ', '.', ' - ', resp_var)
+
+# Fit a model and print results
+xformModel<-lm(fx, data = train_data_xform)
+print(summary(xformModel))
+xformModel.rmse <- sqrt(mean(xformModel$residuals^2))
+cat("Train RMSE is:", xformModel.rmse, "\n")
+
+# Cross validation results
+xformModel_cv <- cvFit(xformModel, data = train_data_xform, 
+                         y = train_data_xform$Gross, 
+                         K=10)
+print(xformModel_cv)
+```
+
+### Interactions
+```{r}
+intModel <- lm(Gross ~ . + .:., data = train_data_numeric_nonNA_subset)
+print(summary(intModel))
+intModel.rmse <- sqrt(mean(intModel$residuals^2))
+cat("Train RMSE for Interaction model is:", intModel.rmse, "\n")
+
+# Cross validation results
+intModel_cv <- cvFit(intModel, data = train_data_numeric_nonNA_subset, 
+                         y = train_data_numeric_nonNA_subset$Gross, 
+                         K=10)
+print(intModel_cv)
+```
+### Final model
+transforms + interactions added to the existing numeric variables
+```{r}
+finalModel <- lm(Gross ~ . +
+                   Runtime:tomatoFresh+
+                   Runtime:tomatoUserRating+
+                   Runtime:Budget+
+                   Runtime:Budget_bin+
+                   Runtime:imdbVotes_P2+
+                   Runtime:tomatoUserRating_P2+
+                   imdbRating:tomatoFresh+
+                   imdbVotes:tomatoReviews+
+                   imdbVotes:tomatoFresh+
+                   imdbVotes:Budget+
+                   tomatoReviews:imdbRating_P2+
+                   tomatoReviews:tomatoUserRating_P2+
+                   tomatoUserRating:Runtime_log+
+                   Budget:imdbVotes_bin+
+                   Budget:Runtime_log+
+                   Runtime_log:imdbVotes_P2+
+                   Runtime_log:tomatoUserRating_P2, 
+                  data = train_data_xform)
+print(summary(finalModel))
+finalModel.rmse <- sqrt(mean(finalModel$residuals^2))
+cat("Train RMSE for Final model is:", finalModel.rmse, "\n")
+
+# Cross validation results
+finalModel_cv <- cvFit(finalModel, data = train_data_xform, 
+                         y = train_data_numeric_nonNA_subset$Gross, 
+                         K=10)
+print(finalModel_cv)
+```
+
+### Lasso model
+
+```{r}
+# #train_temp <- subset(train_data_xform, select=-c(Gross))
+# baseline_log_linear<-lm(Gross~., data = train_data_xform)
+# print(summary(baseline_log_linear))
+# 
+# 
+# # set lambda sequence to use for lasso
+# #lambdas = 10^seq(-10,1.5,0.1)
+# lambdas = 10^seq(-2,1.5,0.1)
+# #lasso
+# # train_Lasso <- train_data_numeric_nonNA_subset[,log_transform]
+# fm.lasso = glmnet(as.matrix(train_data_xform),
+#                   as.double(train_data_xform$Gross), 
+#                   alpha = 1, lambda = lambdas, standardize = TRUE, thresh = 1e-12)
+# summary(fm.lasso)
+# cv_fit<-cv.glmnet(as.matrix(train_data_xform), train_data_xform$Gross, lambda = lambdas, standardize = TRUE)
+# plot(cv_fit)
+# opt_lambda<-cv_fit$lambda.min
+# print(opt_lambda)
+# #summary(cv_fit)
+# #plot(fm.lasso, xvar ="lambda")
+# lasso.predict = predict(glmnet(as.matrix(train_data_xform), train_data_xform$Gross, alpha = 1, lambda = opt_lambda), s = opt_lambda, newx = as.matrix(train_data_xform))
+# sqrt(mean((lasso.predict - train_data_xform$Gross)^2))
+
+```
+
+```{r}
+# # Different approach to calculate Lasso RMSE
+# lasso_reg <-cv.glmnet(as.matrix(train_data_xform), train_data_xform$Gross, alpha = 1, lambda = lambdas, standardize = TRUE, nfolds = 5)
+# 
+# lambda_best <- lasso_reg$lambda.min
+# lambda_best
+```
+```{r}
+# lasso_model <- glmnet(as.matrix(train_data_xform), train_data_xform$Gross, alpha = 1, lambda = lambda_best, standardize = TRUE)
+# 
+# prediction_train <- predict(lasso_model, s = lambda_best, newx = as.matrix(train_data_xform))
+# sqrt(mean((prediction_train - train_data_xform$Gross)^2)) ##RMSE
+```
+
+
+```{r}
+# fm.ridge = glmnet(as.matrix(train_data_xform), train_data_xform$Gross, alpha = 0, lambda = lambdas, standardize = TRUE)
+# #summary(fm.ridge)
+# #plot(fm.ridge, xvar ="lambda")
+# cv_fit_ridge<-cv.glmnet(as.matrix(train_data_xform), train_data_xform$Gross, lambda = lambdas, nfolds = 10)
+# plot(cv_fit_ridge)
+# opt_lambda<-cv_fit_ridge$lambda.min
+# print(opt_lambda)
+```
+```{r}
+# index_RF = sample(nrow(train_data_xform), size = nrow(train_data_xform)*0.60)
+# train_data[index_RF,]
+# fit=randomForest(Gross~., data=train_data_xform, importance = TRUE)
+# #png(file="C:/Users/uzair/Desktop/Stanford/MS&E 226/Project/RF.png", type = "cairo")
+# varImpPlot(fit)
+# print(fit)
+
+```
+
+```{r}
+# rmse_RF = sqrt(mean((predict(fit, train_data_xform) - train_data_xform$Gross)^2))
+# print(rmse_RF)
+```
+
+
+```{r}
+# index_RF_m = sample(nrow(train_data_numeric_nonNA), size = nrow(train_data_numeric_nonNA))
+# train_data[index_RF_m,]
+# fit1=randomForest(Gross~., data=train_data_numeric_nonNA)
+# varImpPlot(fit1)
+# print(fit1)
+```
+
+############# Part 2 ##################
+
+```{r}
+finModel.test <- lm(Gross ~ . +
+                   Runtime:tomatoFresh+
+                   Runtime:tomatoUserRating+
+                   Runtime:Budget+
+                   Runtime:Budget_bin+
+                   Runtime:imdbVotes_P2+
+                   Runtime:tomatoUserRating_P2+
+                   imdbRating:tomatoFresh+
+                   imdbVotes:tomatoReviews+
+                   imdbVotes:tomatoFresh+
+                   imdbVotes:Budget+
+                   tomatoReviews:imdbRating_P2+
+                   tomatoReviews:tomatoUserRating_P2+
+                   tomatoUserRating:Runtime_log+
+                   Budget:imdbVotes_bin+
+                   Budget:Runtime_log+
+                   Runtime_log:imdbVotes_P2+
+                   Runtime_log:tomatoUserRating_P2, 
+                  data = test_data_xform)
+print(summary(finModel.test))
+finModel.rmse.test <- sqrt(mean(finModel.test$residuals^2))
+cat("Test RMSE for Interaction model is:", finModel.rmse.test, "\n")
+
+# Cross validation results
+finModel_cv_test <- cvFit(finModel.test, data = test_data_xform, 
+                         y = test_data_xform$Gross, 
+                         K=10)
+print(finModel_cv_test)
+```
+#####Define Bootstrap function#####
+
+```{r}
+boot.function = function(train_data_xform,index){
+  return(coef(lm(Gross ~ . +
+                   Runtime:tomatoFresh+
+                   Runtime:tomatoUserRating+
+                   Runtime:Budget+
+                   Runtime:Budget_bin+
+                   Runtime:imdbVotes_P2+
+                   Runtime:tomatoUserRating_P2+
+                   imdbRating:tomatoFresh+
+                   imdbVotes:tomatoReviews+
+                   imdbVotes:tomatoFresh+
+                   imdbVotes:Budget+
+                   tomatoReviews:imdbRating_P2+
+                   tomatoReviews:tomatoUserRating_P2+
+                   tomatoUserRating:Runtime_log+
+                   Budget:imdbVotes_bin+
+                   Budget:Runtime_log+
+                   Runtime_log:imdbVotes_P2+
+                   Runtime_log:tomatoUserRating_P2, 
+                  data = train_data_xform, subset = index)))
+}
+
+#Fitting linear models to 1000 bootstrapped samples of training data to estimate Standard error of coefficients
+
+Iteration <- 1000
+set.seed(3945827)
+
+lm.bootstrap<-boot(data = train_data_xform,statistic = boot.function, R=Iteration)
+print(lm.bootstrap)
+```
+
+```{r}
+# reg_table <- data.frame(summary(finalModel)$coefficients) %>%
+#   bind_cols(data_frame(variable = names(finalModel$coefficients))) %>%
+#   transmute(variable = variable,
+#             confint_2.5_reg = Estimate  - 1.96 * Std..Error,
+#             original_reg = Estimate,
+#             confint_97.5_reg = Estimate + 1.96 * Std..Error)
+```
+
+```{r}
+# boostrap_table <- summary(lm.bootstrap) %>%
+#   bind_cols(data_frame(variable = names(finalModel$coefficients))) %>%
+#   mutate(confint_2.5_boot = original - bootSE,
+#          confint_97.5_boot = original + bootSE,
+#          original_boot = original) %>%
+#   select(variable, confint_2.5_boot, original_boot, confint_97.5_boot)
+```
+
+```{r}
+X <- train_data_xform
+X$Gross <- NULL
+Y <- train_data_xform$Gross
+df = data.frame(X,Y)
+
+coef.boot = function(data, indices) {
+  fm = lm(Gross ~ . +
+                   Runtime:tomatoFresh+
+                   Runtime:tomatoUserRating+
+                   Runtime:Budget+
+                   Runtime:Budget_bin+
+                   Runtime:imdbVotes_P2+
+                   Runtime:tomatoUserRating_P2+
+                   imdbRating:tomatoFresh+
+                   imdbVotes:tomatoReviews+
+                   imdbVotes:tomatoFresh+
+                   imdbVotes:Budget+
+                   tomatoReviews:imdbRating_P2+
+                   tomatoReviews:tomatoUserRating_P2+
+                   tomatoUserRating:Runtime_log+
+                   Budget:imdbVotes_bin+
+                   Budget:Runtime_log+
+                   Runtime_log:imdbVotes_P2+
+                   Runtime_log:tomatoUserRating_P2, 
+                  data = train_data_xform)
+  return(coef(fm))
+}
+
+
+boot.out = boot(df, coef.boot, 1000)
+summary(boot.out)
+
+```
+
+```{r}
+lambdas = 10^seq(-10,2,0.1)
+train_Lasso<-train_data_xform
+train_Lasso$Gross<-NULL
+fm.lasso<-glmnet(as.matrix(train_Lasso), as.double(train_data_xform$Gross), alpha=1, standardize = TRUE, thresh = 1e-12)
+plot(fm.lasso, xvar="lambda")
+```
+```{r}
+print(fm.lasso$beta)
+```
+
+```{r}
+fm = lm(Gross ~ . +
+                   Runtime:tomatoFresh+
+                   Runtime:tomatoUserRating+
+                   Runtime:Budget+
+                   Runtime:Budget_bin+
+                   Runtime:imdbVotes_P2+
+                   Runtime:tomatoUserRating_P2+
+                   imdbRating:tomatoFresh+
+                   imdbVotes:tomatoReviews+
+                   imdbVotes:tomatoFresh+
+                   imdbVotes:Budget+
+                   tomatoReviews:imdbRating_P2+
+                   tomatoReviews:tomatoUserRating_P2+
+                   tomatoUserRating:Runtime_log+
+                   Budget:imdbVotes_bin+
+                   Budget:Runtime_log+
+                   Runtime_log:imdbVotes_P2+
+                   Runtime_log:tomatoUserRating_P2, 
+                  data = train_data_xform)
+
+confint(fm, '(Intercept)', level = 0.95)
+confint(fm, 'Year', level = 0.95)
+confint(fm, 'Runtime', level = 0.95)
+confint(fm, 'imdbRating', level = 0.95)
+confint(fm, 'imdbVotes', level = 0.95)
+confint(fm, 'tomatoMeter', level = 0.95)
+```
+
+
+```{r}
+mean(lm.bootstrap$t)-lm.bootstrap$t0
+```
+
+```{r}
+plot(lm.bootstrap)
+```
+
+```{r}
+percentile_ci<-boot.ci(lm.bootstrap, type = "perc")
+print(percentile_ci)
+ci_H=percentile_ci$perc[,c(4,5)]
+print(ci_H)
+```
+
+```{r}
+hist(lm.bootstrap$t[,2])
+
+```
+
+```{r}
+hist(lm.bootstrap$t[,1], probability = T)
+lines(density(lm.bootstrap$t[,1]),col='red')
+abline(v=ci_H, col = 'blue')
+```
+
+```{r}
+#Plotting bootstrap results for 'Year' Covariate
+
+plot(lm.bootstrap, index=2)
+```
+
+```{r}
+###Another method for Bootstrapping
+
+# selected.cov<-c("Gross","Year","Runtime","imdbRating","imdbVotes","tomatoMeter","tomatoRating","tomatoReviews","tomatoFresh","tomatoUserMeter","tomatoUserRating","tomatoUserReviews","Budget","Date","imdbVotes_bin","Budget_bin","Runtime_log","imdbRating_P2","imdbVotes_P2","imdbUserRating_P2")
+
+
+X <- train_data_xform
+X$Gross <- NULL
+Y <- train_data_xform$Gross
+df = data.frame(X,Y)
+
+coef.boot = function(data, indices) {
+  fm = lm(Gross ~ . +
+                   Runtime:tomatoFresh+
+                   Runtime:tomatoUserRating+
+                   Runtime:Budget+
+                   Runtime:Budget_bin+
+                   Runtime:imdbVotes_P2+
+                   Runtime:tomatoUserRating_P2+
+                   imdbRating:tomatoFresh+
+                   imdbVotes:tomatoReviews+
+                   imdbVotes:tomatoFresh+
+                   imdbVotes:Budget+
+                   tomatoReviews:imdbRating_P2+
+                   tomatoReviews:tomatoUserRating_P2+
+                   tomatoUserRating:Runtime_log+
+                   Budget:imdbVotes_bin+
+                   Budget:Runtime_log+
+                   Runtime_log:imdbVotes_P2+
+                   Runtime_log:tomatoUserRating_P2, data = train_data_xform)
+  return(coef(fm))
+}
+
+boot.out = boot(df, coef.boot, 1000)
+summary(boot.out)
+```
+
+```{r}
+#Boxplot
+
+SE_R = coef(summary(fm))[,2]
+SE_ <- vector()
+
+for (i in 1:31){
+  SE_[i] = SE_R[i]/sd(boot.out$t[,i])
+}
+boxplot(SE_)
+```
+
+```{r}
+plot(boot.out)
+```
+
+```{r}
+#Getting Confidence intervals for Bootstrap estimates
+for (i in 1:31) {
+  print(i)
+  print(boot.ci(lm.bootstrap, type = "perc", index=i))
+  
+}
+```
+
+```{r}
+#Getting Confidence intervals for Regression estimates
+conf_int_OLS<-confint(finalModel, level = 0.95)
+print(conf_int_OLS)
+
+```
+
+
+```{r}
+revisedmodel<- lm(Gross ~ Year+Runtime+imdbRating+imdbVotes+tomatoReviews+Budget+.:., data =train_data_xform)
+summary(revisedmodel)
+```
+
+```{r}
+#Extracting p-values from the final model
+p.vals<-summary(finalModel)$coef[,4]
+p.vals
+```
+```{r}
+#Using Benjamin-Hochberg to adjust p-values for multiple hypothesis testing
+benj.hoch<-p.adjust(p.vals, method = 'BH', n=31)
+benj.hoch
+```
+```{r}
+#Using Bonferroni to adjust p-values for multiple hypothesis testing
+bonferroni<-p.adjust(p.vals, method = 'bonferroni', n=31)
+bonferroni
+```
+```{r}
+#Comparing p-values from all three methods
+p.val_table<-data.frame(p.vals, benj.hoch, bonferroni)
+colnames(p.val_table)<-c('OLS','Benjamini-Hochberg','Bonferroni')
+kable(p.val_table,caption = "P-value comparison for all three models",
+align = "c")
+
+```
+```{r}
+library(jtools)
+summ(finalModel, confint=TRUE, digits=3)
+```
+```{r}
+library(stargazer)
+stargazer(finalModel, title = "OLS Results", align = TRUE, type = "latex", ci = TRUE)
+```
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,396 @@
+---
+title: "MS&E 226 Mini Project - Part 1"
+author: "Ramesh Manian & Uzair Mansuri"
+date: "October 20, 2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, tidy.opts=list(width.cutoff=60), 
+                      message = FALSE, warning = FALSE, fig.width=7, fig.height=4)
+library(tidyverse)
+library(Metrics)
+library(cvTools)
+library(GGally)
+library(corrplot)
+library(kableExtra)
+library(ggthemes)
+library(knitr)
+library(kableExtra)
+library(tokenizers)
+library(tm)
+library(MASS)
+library(glmnet)
+library(boot)
+library(pROC)
+```
+
+#Summary 
+
+Our project investigates the correlation of Gross revenue for 
+popular web streaming site Netflix, obtained from movies
+released between 1888 and 2018. This dataset contains a rich set of
+40,789 observations with 39 covariates, including Title, runtime, year released,
+No of awards, imDb ratings, total budget among others. 
+
+The dataset comes from a Data visualization course taught by Georgia Tech.
+Although there is little information about the source of the data and it does
+not appear on any public domain, there is very little information about the data collection process. 
+There are multiple entries with NA values, incomplete or missing entries and Strings, that will 
+require data cleansing prior to building our predictive Model.
+
+This report summarizes our progress so far, and provides information regarding:
+(1) data cleaning steps; (2) possible response variables; (3) possible research
+questions; (4) data summary steps; and (5) current interesting findings. 
+
+```{r}
+#Extracting Data & creating Dataframe
+
+df_movies<-load("C:/Users/uzair/OneDrive/MS&E 226 - Project 1/netflix/movies_merged")
+df = movies_merged
+
+#Gathering information on explanatory variables for 40,789 observations
+cat("Column names:", end="\n", file="")
+colnames(df)
+
+```
+#Data Cleaning
+
+###Removing non-movie rows:
+```{r}
+#Remove all rows from df that do not correspond to movies
+
+df2 <- df[df$Type == "movie",]
+dim(df2)
+
+# save df2 as df
+df <- df2
+```
+
+### Drop rows with missing `Gross` value
+
+our goal is to model `Gross` revenue against other variables, therefore, rows that have missing `Gross` values are not useful to us.
+
+```{r}
+# Remove rows with missing Gross value
+# subset rows with valid gross values
+df_gross_val = subset(df, !is.na(df$Gross))
+df = df_gross_val
+cat("Movies only dataset with valid Gross value has", dim(df)[1], "samples and", dim(df)[2], "features", "\n")
+```
+
+
+
+### Process `Runtime` column
+
+The variable `Runtime` represents the length of the title as a string. Let us convert it to a numeric value (in minutes) and replace `Runtime` with the new numeric column.
+
+```{r}
+# Replace df$Runtime with a numeric column containing the runtime in minutes
+# look for three time patterns in run_time "xx h yy min" or "xx h" or "xx min" 
+runtime_pattern = c("(\\d+)\\sh\\s(\\d+)\\smin", "(\\d+)\\sh", "(\\d+)\\smin")
+normalize_NA_convert_to_min <- function(s) {
+    # convert N/A to NA
+    if (s == "N/A"|| s == "n/a" || s == "N/a" || s == "n/A") return(NA)
+    # go through the possible ways time can be shown
+    for (i in 1:length(runtime_pattern)) {
+        val = str_match(s, runtime_pattern[i])
+        if (!is.na(val[1])) {
+            if (i == 1) return(as.numeric(val[2])*60 + as.numeric(val[3]))
+            else if (i == 2) return(as.numeric(val[2])*60)
+            else if (i == 3) return(as.numeric(val[2]))
+        }
+    }
+}
+df$Runtime = sapply(df$Runtime, normalize_NA_convert_to_min)
+```
+
+Let us extract valid observations; ones with budget information in our case
+```{r}
+# Remove rows that have NA values in runtime and budget columns
+df_rt_budget <- subset(df, !is.na(df$Runtime) & 
+                      !is.na(df$Budget))
+# 4520 observations are there with just Runtime and Budget being non-NA
+cat("Number of rows to be removed with non NA values in Runtime and budget :", 
+    nrow(df_rt_budget))
+```
+### Encode `Genre` column
+
+The column `Genre` represents a list of genres associated with the movie in a string format. Let us parse each text string into a binary vector with 1s representing the presence of a genre and 0s the absence, and add it to the dataframe as additional columns. We will then remove the original `Genre` column.
+
+For example, if there are a total of 3 genres: Drama, Comedy, and Action, a movie that is both Action and Comedy should be represented by a binary vector <0, 1, 1>. Note that you need to first compile a dictionary of all possible genres and then figure out which movie has which genres.
+
+```{r}
+# # Get a dictionary of all possible genres
+# dim(df)
+# genre_dict = sort(tolower(unique(unlist(tokenize_regex(df$Genre, pattern=", ")))))
+# print(genre_dict)
+# 
+# # Replace Genre with a collection of binary columns
+# # convert each row with binaries for genres
+# binary_conversion <- function(row_v, dict) {
+# # Remove commas after genres
+#     gc <- VCorpus(VectorSource(tolower(gsub(",", "", row_v))))
+#      #calculate counts of each genre
+#     cnt <- as.matrix(TermDocumentMatrix(gc, list(dictionary=dict)))
+#   # ste them as list
+#     rslt_list <- as.numeric(qdapTools::counts2list(cnt))
+#     rslt_list[is.na(rslt_list)] <- 0
+#     return(t(rslt_list)[1,])
+# }
+# # merge the newly created genre data into the data frame
+# # I am sure there is a smpler way. I found this technique in the R cookbook
+#  genre_conv <- t(sapply(df$Genre, binary_conversion, dic=genre_dict))
+#  rownames(genre_conv) <- c(1:dim(genre_conv)[1])
+#  colnames(genre_conv) <- genre_dict
+#  rownames(df) <- c(1:dim(genre_conv)[1])
+#  df_genre_conv <- data.frame(genre_conv)
+# # merge the binary df to df and delete Genre column
+# df <- merge(subset(df, select=-Genre), df_genre_conv, by=0)
+#  #sort df by ordered column names
+# df <- df[,order(names(df))]
+
+```
+### Eliminate mismatched rows
+
+Compare the `Released` column (string representation of release date) with either `Year` or `Date` (numeric representation of the year) to find mismatches.
+
+```{r}
+# Remove mismatched rows
+# Remove all rows with Year/Date/release mismatch 
+correct_year_mismatch = function(dft){
+    dft["YearRel"] = as.numeric(format(as.Date(dft$Released, 
+                                      format = "%Y-%m-%d"), "%Y"))
+    c1 = (is.na(dft$Date) | (dft$Year == dft$Date) | 
+              (!is.na(dft$YearRel) && dft$YearRel == dft$Date))
+    dft = dft[c1,]
+    # delete temporary column or numeric representation of Released
+    dft = subset(dft, select=-YearRel)
+    return(dft)
+}
+
+df_non_mismatched_year = correct_year_mismatch(df)
+new_cnt = nrow(df_non_mismatched_year)
+# compute percentage of mis-matched rows removed
+df = df_non_mismatched_year
+cat("Non-mismatched dataset has", dim(df)[1], "samples and", dim(df)[2], "features", "\n")
+```
+### Drop `Domestic_Gross` column
+
+`Domestic_Gross` is basically the amount of revenue a movie earned within the US. Quite likely, it is very highly correlated with `Gross` and is in fact equal to it for movies that were not released globally. Hence, we will remove it for modeling purposes.
+
+```{r}
+# TODO: Exclude the `Domestic_Gross` column
+df_gross_removed = subset(df, select=-Domestic_Gross)
+df = df_gross_removed
+cat("Domestic_Gross removed dataset has", dim(df)[1], "samples and", dim(df)[2], "features", "\n")
+
+```
+### Final preprocessed dataset
+
+Let us look at the dimensions of the preprocessed dataset that we will be using for modeling and evaluation. Let us also print all the final covariates list. 
+
+```{r}
+# TODO: Print the dimensions of the final preprocessed dataset and column names
+cat("Pre-processed dataset has", dim(df)[1], "samples and", dim(df)[2], "features. Features are printed below.", "\n")
+pre_processed_df = df
+print(sort(colnames(df)))
+```
+## Model Evaluation
+
+### Numeric variables
+
+We will be using Linear Regression to predict `Gross` based on available _numeric_ variables. 
+
+```{r}
+# Model 1. Numeric 
+# =======================
+# Build & evaluate model 1 (numeric variables only)
+# This function randomizes data and splits into train and test datasets
+pre_process_data = function(df, test_frac=0.20){
+    # shuffle data - sample(nrow(df)) gives randomized indices for selection
+    df = df[sample(nrow(df)), ]
+    num_samples = nrow(df)
+    num_test_samples = as.integer(num_samples * test_frac)
+    num_train_samples = num_samples - num_test_samples
+    train_data = df[1:num_train_samples, ]
+    test_data = df[(num_train_samples+1):num_samples, ]
+    return(list(train_data=train_data, test_data=test_data))
+}
+
+# get data processed and ready. 
+rslt = pre_process_data(df)
+train_data = rslt$train_data
+test_data = rslt$test_data
+```
+
+For our prediction, we will focus on numeric variables. Use the filter function which gets all types of numeric variabels including floats and ints.
+
+```{r}
+train_data_numeric = Filter(is.numeric, train_data)
+test_data_numeric = Filter(is.numeric, test_data)
+```
+
+We might also want to see if we should use only a subset of numeric variables to better understand the relationship between features. To do this, we could do a correlation plot. This plot will show correlation between -1 and +1. Very strongly positively correlated ones will be shown as very dark blue circle and the intensity of blue will smaller as the +ve correlation decreases. -ve correlation is shown in orange similarly.
+
+\pagebreak
+\section{Classification}
+
+```{r}
+tr_cor_df = cor(na.omit(train_data_numeric))
+#png(file="C:/Users/uzair/Desktop/Stanford/MS&E 226/Project/Correlation.png", type = "cairo")
+corrplot(tr_cor_df, method="circle")
+```
+
+```{r}
+lr_train_temp<-na.omit(train_data_numeric)
+
+lr_test_temp<-na.omit(test_data_numeric)
+```
+
+
+```{r}
+# Formulate the problem as a classification problem
+
+threshold = 7
+
+lr_train_temp$imdbRating = as.integer(lr_train_temp$imdbRating>threshold)
+lr_test_temp$imdbRating = as.integer(lr_test_temp$imdbRating>threshold)
+
+```
+
+
+```{r}
+#Running full model first with all covariates
+
+full_model = glm(imdbRating ~ ., family = "binomial", data = lr_train_temp)
+summary(full_model)
+```
+
+```{r}
+#Running null model with intercept only
+
+null_model = glm(imdbRating ~ 1, family = "binomial", data = lr_train_temp)
+summary(null_model)
+```
+```{r}
+step(null_model, list(upper = full_model), direction = 'forward')
+```
+```{r}
+fitted_model = fitted(full_model)
+table(fitted_model>0.5, lr_train_temp$imdbRating)
+table(fitted_model>0.7,lr_train_temp$imdbRating) #selecting 0.7 as our threshold for Y
+
+roc_data = data.frame(fit = fitted_model, obs = lr_train_temp$imdbRating)
+my_roc = roc(roc_data$obs ~ roc_data$fit, plot = FALSE)
+
+cat("AUC", toString(auc(my_roc)))
+
+#png(file="C:/Users/uzair/Desktop/Stanford/MS&E 226/Project/ROC.png", type = "cairo")
+plot(my_roc)
+
+```
+
+
+
+
+
+
+
+###Code below is a different approach to classification using CV
+```{r}
+
+# 0-1 loss cost function
+cost_function = function(y, y_hat) {
+	mean(as.integer(y_hat > 0.5) != y)
+}
+```
+
+```{r}
+#### Best AIC model####
+
+lr = glm(formula = imdbRating ~ .,
+         family = "binomial",
+         data = lr_train_temp)
+print(summary(lr))
+```
+```{r}
+###Calculating Error
+
+lr.error = mean(as.integer(lr$fitted.values > 0.5) != lr_train_temp$imdbRating)
+print(lr.error)
+
+```
+```{r}
+# Cross validation for test error estimation
+
+lr.cv = cv.glm(data=lr_train_temp, glmfit=lr, cost=cost_function, K=10)
+lr.cv.error = lr.cv$delta[1]
+print(lr.cv.error)
+```
+
+```{r}
+###Calculating accuracy on training set
+# fitted.results.train<-predict(lr, lr_train_temp)
+# fitted.results.train<-ifelse(fitted.results>0.5,1,0)
+# misClasificError.train<-mean(fitted.results != lr_train_temp$imdbRating)
+# print(paste('Accuacy',1-misClasificError.train))
+
+```
+
+
+```{r}
+#Running Interaction model
+
+lr.interaction = glm(imdbRating~. + .:., family = "binomial", data = lr_train_temp)
+print(summary(lr.interaction))
+```
+```{r}
+###Calculating Error for interaction
+
+lr.error.interaction = mean(as.integer(lr.interaction$fitted.values > 0.5) != lr_train_temp$imdbRating)
+print(lr.error.interaction)
+```
+```{r}
+# Cross validation for test error estimation on interaction model
+
+lr.cv.interaction = cv.glm(data=lr_train_temp, glmfit=lr.interaction, cost=cost_function, K=10)
+lr.cv.error.interaction = lr.cv.interaction$delta[1]
+print(lr.cv.error)
+```
+```{r}
+# # Predictions of the best model and the baseline on the test set
+# pred.best = as.numeric(predict(lr, lr_test_temp) >= 0)
+# pred.baseline = as.numeric(predict(null_model, lr_test_temp) >= 0)
+# 
+# # Ground truth
+# truth = lr_test_temp$imdbRating
+# 
+# # Compute 0-1 loss for best model and baseline
+# mean(as.numeric(pred.best != lr_test_temp$imdbRating))
+# mean(as.numeric(pred.baseline != lr_test_temp$imdbRating))
+# 
+# # Plot the ROC curve and compute AUC
+# prob.baseline = predict(null_model, lr_test_temp, type=c("response"))
+# prob.best = predict(lr, lr_test_temp, type=c("response"))
+# lr_test_temp$prob.baseline = prob.baseline
+# lr_test_temp$prob.best = prob.best
+# 
+# g.baseline <- roc(imdbRating ~ prob.baseline, data = lr_test_temp)
+# g.best <- roc(imdbRating ~ prob.best, data = lr_test_temp)
+# 
+# plot(g.baseline, col="red")
+# plot(g.best, col="blue", add=TRUE)
+# auc(g.best)
+# auc(g.baseline)
+# ```
+# ```{r}
+# ###Calculating accuracy on test set
+# fitted.results<-predict(lr, lr_test_temp)
+# fitted.results<-ifelse(fitted.results>0.5,1,0)
+# misClasificError<-mean(fitted.results != lr_test_temp$imdbRating)
+# print(paste('Accuacy',1-misClasificError))
+
+```
+
+
